@@ -34,6 +34,9 @@ install -Dpm 0755 target/rpm/release/sd %{buildroot}%{_bindir}/sd
 %{_bindir}/sd
 
 %changelog
+* Tue Nov 24 2026 kernelzeroday - 0.2.1-1
+- Tab completes file paths for /file, /batch, /load and path settings.
+
 * Tue Nov 24 2026 kernelzeroday - 0.2.0-1
 - Prompt box grows with long prompts; notices replace the log pane; /file and /batch;
   sd -f / sd -b; diagnostics to the system log; conv_direct setting; RPM packaging.

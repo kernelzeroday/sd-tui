@@ -106,9 +106,24 @@ const KEYS: &[(&str, &str)] = &[
         "Esc",
         "cancel the running image and the queue; otherwise clear the input",
     ),
-    ("Tab", "complete a /command"),
+    ("Tab", "complete a /command, or a file path (/file, /batch, /load, ...)"),
     ("Ctrl+U", "clear the input"),
     ("Ctrl+C", "quit"),
+];
+
+/// Commands whose argument is a file path, so Tab completes paths.
+const PATH_COMMANDS: &[&str] = &[
+    "/file",
+    "/batch",
+    "/load",
+    "/upscale",
+    "/model",
+    "/diffusion_model",
+    "/llm",
+    "/vae",
+    "/tokenizer",
+    "/lora_dir",
+    "/sd_cli",
 ];
 
 /// How long a non-error notice stays on the status line.
@@ -650,7 +665,14 @@ impl App {
     }
 
     fn complete(&mut self) {
-        if !self.input.starts_with('/') || self.input.contains(' ') {
+        if !self.input.starts_with('/') {
+            return;
+        }
+        if let Some((cmd, arg)) = self.input.split_once(' ') {
+            if PATH_COMMANDS.contains(&cmd) && self.cursor == self.input.chars().count() {
+                let (cmd, arg) = (cmd.to_string(), arg.trim_start().to_string());
+                self.complete_path_arg(&cmd, &arg);
+            }
             return;
         }
         let matches: Vec<_> = COMMANDS
@@ -671,6 +693,29 @@ impl App {
                 self.input.clear();
                 self.cursor = 0;
             }
+        }
+    }
+
+    /// Shell-style Tab for a path argument: finish the name when it's unique, otherwise extend
+    /// to the longest shared prefix, otherwise list the candidates on the status line.
+    fn complete_path_arg(&mut self, cmd: &str, arg: &str) {
+        let candidates = path_candidates(arg);
+        let shared = common_prefix(&candidates);
+        if shared.chars().count() > arg.chars().count() {
+            self.input = format!("{cmd} {shared}");
+            self.cursor = self.input.chars().count();
+        } else if candidates.len() > 1 {
+            let names: Vec<&str> = candidates
+                .iter()
+                .map(|c| {
+                    let t = c.trim_end_matches('/');
+                    let start = t.rfind('/').map_or(0, |i| i + 1);
+                    &c[start..]
+                })
+                .collect();
+            self.info(names.join("  "));
+        } else if candidates.is_empty() {
+            self.info(format!("no files match {arg}"));
         }
     }
 
@@ -1284,6 +1329,55 @@ fn help_lines() -> Vec<Line<'static>> {
     lines
 }
 
+/// Paths that `partial` could complete to, as typed (a leading `~/` is kept). Directories end
+/// in `/`. Hidden files only show up once the name being typed starts with a dot.
+fn path_candidates(partial: &str) -> Vec<String> {
+    let partial = if partial == "~" { "~/" } else { partial };
+    let (dir, prefix) = match partial.rfind('/') {
+        Some(i) => (&partial[..=i], &partial[i + 1..]),
+        None => ("", partial),
+    };
+    let read_from = if dir.is_empty() {
+        ".".to_string()
+    } else {
+        runner::expand_home(dir)
+    };
+    let Ok(entries) = std::fs::read_dir(&read_from) else {
+        return Vec::new();
+    };
+    let mut out: Vec<String> = entries
+        .flatten()
+        .filter_map(|e| {
+            let name = e.file_name().to_string_lossy().into_owned();
+            if !name.starts_with(prefix) || (name.starts_with('.') && !prefix.starts_with('.')) {
+                return None;
+            }
+            // Follow symlinks so a linked folder completes like a folder.
+            let is_dir = std::fs::metadata(e.path()).is_ok_and(|m| m.is_dir());
+            Some(format!("{dir}{name}{}", if is_dir { "/" } else { "" }))
+        })
+        .collect();
+    out.sort();
+    out
+}
+
+fn common_prefix(items: &[String]) -> String {
+    let Some(first) = items.first() else {
+        return String::new();
+    };
+    let mut len = first.len();
+    for s in &items[1..] {
+        len = first
+            .char_indices()
+            .zip(s.chars())
+            .take_while(|((_, a), b)| a == b)
+            .last()
+            .map_or(0, |((i, a), _)| i + a.len_utf8())
+            .min(len);
+    }
+    first[..len].to_string()
+}
+
 /// Where each line of `text` starts (in chars) when word-wrapped to `width` columns. Lines
 /// break after a space when there is one; a word longer than the line is split.
 fn wrap_starts(text: &str, width: usize) -> Vec<usize> {
@@ -1443,6 +1537,30 @@ mod tests {
         assert_eq!(input_rows("abcd", 2, 4), 1);
         let starts = wrap_starts("aaaa bbbb cccc", 6);
         assert_eq!(cursor_row_col(&starts, 7, 6), (1, 2));
+    }
+
+    #[test]
+    fn paths_complete_like_a_shell() {
+        let dir = std::env::temp_dir().join(format!("sd-tui-complete-{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("Documents")).unwrap();
+        std::fs::create_dir_all(dir.join("Downloads")).unwrap();
+        std::fs::write(dir.join("prompts.txt"), "x").unwrap();
+        std::fs::write(dir.join(".hidden"), "x").unwrap();
+        let base = format!("{}/", dir.display());
+        assert_eq!(
+            path_candidates(&format!("{base}Doc")),
+            vec![format!("{base}Documents/")]
+        );
+        let d = path_candidates(&format!("{base}D"));
+        assert_eq!(d.len(), 2);
+        assert_eq!(common_prefix(&d), format!("{base}Do"));
+        assert_eq!(path_candidates(&base).len(), 3, "dotfiles hidden");
+        assert_eq!(path_candidates(&format!("{base}.h")).len(), 1);
+        assert_eq!(
+            path_candidates("~").first().map(|s| s.starts_with("~/")),
+            Some(true)
+        );
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]

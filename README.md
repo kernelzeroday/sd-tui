@@ -41,7 +41,7 @@ sd --sessions              # recent sessions
 | ←/→, Home/End | browse images (empty prompt); otherwise move the cursor |
 | Esc | cancel the running image and clear the queue; otherwise clear the input |
 | ↑/↓ | move between the prompt's lines, then prompt history (restored when resuming) |
-| Tab | complete a /command |
+| Tab | complete a /command, or a file path after `/file`, `/batch`, `/load`, `/upscale`, ... |
 | Ctrl+U | clear the input |
 | Ctrl+C | quit |
 
