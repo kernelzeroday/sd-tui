@@ -1,0 +1,32 @@
+[package]
+name = "sd-tui"
+version = "0.1.0"
+edition = "2024"
+description = "A streamlined terminal UI for stable-diffusion.cpp: type a prompt, get an image"
+license = "Apache-2.0"
+repository = "https://github.com/kernelzeroday/sd-tui"
+
+[[bin]]
+name = "sd"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1.0.105"
+base64 = "0.23.1"
+chrono = { version = "0.4.45", default-features = false, features = ["clock"] }
+clap = { version = "4.6.9", features = ["derive"] }
+crossterm = { version = "0.29", features = ["use-dev-tty"] }
+directories = "6.0.0"
+image = "0.25.10"
+ratatui = "0.30"
+ratatui-image = { version = "11.1.0", default-features = false, features = ["image-defaults", "crossterm"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.154"
+shlex = "2.0.1"
+toml = "1.2.2"
+ureq = { version = "3.5.2", features = ["json"] }
+
+[profile.release]
+lto = "thin"
+codegen-units = 4
+strip = "symbols"
