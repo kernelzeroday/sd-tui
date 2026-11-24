@@ -3,12 +3,15 @@
 //! `sd` opens the interface: each line you type is an image request, shown in the terminal
 //! (kitty/sixel/iTerm2) and saved to the current folder. Profiles run sd-cli locally or send
 //! requests to an sd-server. Every request is logged to a resumable session.
-//! `sd "a prompt"` generates one image without the interface and prints its path.
+//! `sd "a prompt"` generates one image without the interface and prints its path; `-f FILE`
+//! reads that prompt from a file and `-b FILE` generates one image per line of a file.
 
 mod config;
 mod menu;
+mod prompts;
 mod runner;
 mod session;
+mod syslog;
 mod tui;
 
 use std::{path::PathBuf, time::Instant};
@@ -30,6 +33,14 @@ use crate::{
 struct Cli {
     /// Generate one image from this prompt and exit, without the interface
     prompt: Vec<String>,
+
+    /// Generate one image from the prompt in FILE (its lines are joined; "-" = stdin)
+    #[arg(short, long, value_name = "FILE", conflicts_with_all = ["prompt", "batch"])]
+    file: Option<String>,
+
+    /// Generate one image per line of FILE ("#" lines and blank lines are skipped; "-" = stdin)
+    #[arg(short, long, value_name = "FILE", conflicts_with = "prompt")]
+    batch: Option<String>,
 
     /// Profile to use (default: default_profile from the config)
     #[arg(short, long)]
@@ -98,35 +109,44 @@ fn main() -> Result<()> {
     std::fs::create_dir_all(&out_dir).with_context(|| format!("creating {}", out_dir.display()))?;
     let out_dir = out_dir.canonicalize().unwrap_or(out_dir);
 
-    if !cli.prompt.is_empty() {
+    let one_shot: Option<Vec<String>> = if let Some(f) = &cli.file {
+        let prompt = prompts::one(&prompts::read(f)?);
+        anyhow::ensure!(!prompt.is_empty(), "{f} has no prompt in it");
+        Some(vec![prompt])
+    } else if let Some(f) = &cli.batch {
+        let list = prompts::batch(&prompts::read(f)?);
+        anyhow::ensure!(!list.is_empty(), "{f} has no prompts in it");
+        Some(list)
+    } else if !cli.prompt.is_empty() {
+        Some(vec![cli.prompt.join(" ")])
+    } else {
+        None
+    };
+    if let Some(list) = one_shot {
         let profile = config.profile(&profile_name)?;
-        let prompt = cli.prompt.join(" ");
         eprintln!("{profile_name}: {}", profile.summary());
         let mut log = Session::open(&sessions_dir, CLI_SESSION).unwrap_or_else(|_| Session {
             id: CLI_SESSION.into(),
             file: sessions_dir.join(format!("{CLI_SESSION}.jsonl")),
             entries: Vec::new(),
         });
-        let started = Instant::now();
-        let result = runner::run_blocking(profile.clone(), prompt.clone(), out_dir);
-        let mut entry = Entry::new(
-            &prompt,
-            &profile_name,
-            &profile,
-            if result.is_ok() { "ok" } else { "failed" },
-        );
-        match &result {
-            Ok(path) => {
-                entry.path = Some(path.clone());
-                entry.seed = seed_from_name(path);
-                entry.elapsed_s = Some((started.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+        let total = list.len();
+        let mut failed = 0;
+        for (i, prompt) in list.into_iter().enumerate() {
+            if total > 1 {
+                eprintln!("[{}/{total}] {prompt}", i + 1);
             }
-            Err(e) => entry.error = Some(format!("{e:#}")),
+            match one_shot_image(&profile_name, &profile, &prompt, &out_dir, &mut log) {
+                Ok(path) => println!("{}", path.display()),
+                // A batch keeps going; a single prompt reports its error as the exit status.
+                Err(e) if total > 1 => {
+                    eprintln!("failed: {e:#}");
+                    failed += 1;
+                }
+                Err(e) => return Err(e),
+            }
         }
-        if let Err(e) = log.append(entry) {
-            eprintln!("warning: couldn't write the session log: {e:#}");
-        }
-        println!("{}", result?.display());
+        anyhow::ensure!(failed == 0, "{failed} of {total} images failed");
         return Ok(());
     }
 
@@ -143,6 +163,36 @@ fn main() -> Result<()> {
         session,
         sessions_dir,
     })
+}
+
+fn one_shot_image(
+    profile_name: &str,
+    profile: &config::Profile,
+    prompt: &str,
+    out_dir: &std::path::Path,
+    log: &mut Session,
+) -> Result<PathBuf> {
+    let started = Instant::now();
+    let result = runner::run_blocking(profile.clone(), prompt.to_string(), out_dir.to_path_buf());
+    let mut entry = Entry::new(
+        prompt,
+        profile_name,
+        profile,
+        if result.is_ok() { "ok" } else { "failed" },
+    );
+    match &result {
+        Ok(path) => {
+            entry.path = Some(path.clone());
+            entry.seed = seed_from_name(path);
+            entry.elapsed_s = Some((started.elapsed().as_secs_f64() * 10.0).round() / 10.0);
+        }
+        Err(e) => entry.error = Some(format!("{e:#}")),
+    }
+    if let Err(e) = log.append(entry) {
+        syslog::err(&format!("couldn't write the session log: {e:#}"));
+        eprintln!("warning: couldn't write the session log: {e:#}");
+    }
+    result
 }
 
 /// Seeds are in the file name: sd-YYYYmmdd-HHMMSS-sSEED.png

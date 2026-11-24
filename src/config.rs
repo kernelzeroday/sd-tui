@@ -102,6 +102,10 @@ pub struct Profile {
     pub hires_scale: f32,
     #[serde(default = "default_hires_denoise")]
     pub hires_denoise: f32,
+    /// Local only: sd.cpp's direct-convolution kernels, `auto` (probe the GPU on every run,
+    /// the default), `on` or `off`. Set `off` where the probe always fails, to skip it.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub conv_direct: Option<String>,
     /// Local only: extra sd-cli arguments appended to the generation command.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub extra: Vec<String>,
@@ -213,6 +217,15 @@ impl Profile {
                     _ => bail!("target is 'local' or 'server'"),
                 }
             }
+            "conv_direct" => {
+                self.conv_direct = match v {
+                    "" | "auto" | "default" => None,
+                    "on" | "off" => Some(v.to_string()),
+                    // sd-cli also takes assignments like "auto,vae=off"
+                    other if other.contains('=') => Some(other.to_string()),
+                    _ => bail!("conv_direct is auto, on or off"),
+                }
+            }
             "extra" => self.extra = shlex::split(v).context("could not parse extra arguments")?,
             _ => bail!("unknown setting '{key}' (see /help)"),
         }
@@ -289,6 +302,7 @@ impl Profile {
             "recipe" => opt(&self.recipe),
             "url" => opt(&self.url),
             "target" => format!("{:?}", self.target).to_lowercase(),
+            "conv_direct" => self.conv_direct.clone().unwrap_or_else(|| "auto".into()),
             "extra" => self.extra.join(" "),
             _ => return None,
         })

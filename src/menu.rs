@@ -15,6 +15,9 @@ pub enum Action {
     Resume,
     /// Run the value as a command line (the `/` menu).
     Command,
+    /// Run `/file VALUE` or `/batch VALUE`.
+    File,
+    Batch,
 }
 
 #[derive(Debug, Clone)]
@@ -223,6 +226,14 @@ pub fn for_setting(key: &str, profile: &Profile, shown_seed: Option<i64>) -> Opt
             ],
         },
         "vae_tiling" | "tiling" => vec![c("on", "less memory when decoding"), c("off", "")],
+        "conv_direct" => vec![
+            c(
+                "auto",
+                "probe the GPU each run, use the fast kernel if it checks out",
+            ),
+            c("off", "skip the probe (where it fails anyway)"),
+            c("on", "always use the direct kernel"),
+        ],
         "hires_scale" => vec![c("1.5", ""), c("2", ""), c("3", ""), c("4", "")],
         "hires_denoise" => vec![
             c("0.2", "keep the image, add a little detail"),
@@ -312,6 +323,17 @@ pub fn sessions(rows: &[crate::session::Summary], current: &str) -> Menu {
         choices,
         Some(current.to_string()),
     )
+}
+
+/// Text files to load prompts from (`/file`, `/batch`).
+pub fn prompt_files(files: Vec<String>, batch: bool) -> Menu {
+    let (title, action, note) = if batch {
+        ("/batch", Action::Batch, "one image per line")
+    } else {
+        ("/file", Action::File, "load as the prompt")
+    };
+    let choices = files.into_iter().map(|f| c(f, note)).collect();
+    Menu::new(title, action, choices, None)
 }
 
 pub fn commands(list: &[(&str, &str)]) -> Menu {

@@ -1,6 +1,8 @@
-//! The full-screen interface: the session's images on top (newest first shown, ←/→ to browse,
-//! the prompt that made each one underneath), a short log, a status line, and a prompt.
-//! Every line typed is an image request; lines starting with "/" are commands.
+//! The full-screen interface: the session's image on top (←/→ to browse, the prompt that made
+//! it on the frame's bottom edge), a status line (profile, progress, short notices), and a prompt
+//! box that grows as the prompt gets longer. Every line typed is an image request; lines
+//! starting with "/" are commands. Longer output (/help, /show) opens a scrollable panel.
+//! Diagnostics go to the system log (`journalctl -t sd`), not the screen.
 
 use std::{
     collections::VecDeque,
@@ -27,8 +29,10 @@ use ratatui_image::{
 use crate::{
     config::{Config, Profile},
     menu::{self, Action, Menu},
+    prompts,
     runner::{self, Event, Job},
     session::{self, Entry, Session},
+    syslog,
 };
 
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
@@ -36,7 +40,6 @@ const ACCENT: Color = Color::Rgb(255, 160, 200);
 
 const COMMANDS: &[(&str, &str)] = &[
     ("/help", "show commands and settings"),
-    ("/profiles", "list profiles"),
     (
         "/profile",
         "NAME: switch profile (drops unsaved /set changes)",
@@ -51,6 +54,14 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/seed", "N|random: fixed seed, or a new one per image"),
     ("/sampler", "NAME: euler, euler_a, dpm++2m, er_sde, ..."),
     ("/neg", "TEXT: negative prompt (/neg off clears it)"),
+    (
+        "/file",
+        "PATH: load a prompt from a text file into the input (lines are joined)",
+    ),
+    (
+        "/batch",
+        "PATH: queue one image per line of a text file (# lines skipped)",
+    ),
     (
         "/upscale",
         "PATH|NAME|off: upscale after generating (local: ESRGAN file, server: hires upscaler)",
@@ -68,23 +79,40 @@ const COMMANDS: &[(&str, &str)] = &[
         "put the shown image's prompt in the input to edit",
     ),
     ("/open", "open the shown image in the system viewer"),
-    ("/sessions", "list recent sessions"),
-    (
-        "/resume",
-        "[ID]: switch to a session (default: the most recent other one)",
-    ),
+    ("/resume", "[ID]: switch to another session"),
     ("/new", "start a new session"),
     ("/config", "show the config and session file paths"),
-    ("/clear", "clear the log"),
     ("/quit", "exit (also Ctrl+C)"),
 ];
 
-const SET_HELP: &str = "every setting is also a command (/KEY VALUE, bare /KEY shows it): size=WxH aspect=W:H width height steps cfg sampler seed=N|random negative=\"...\" \
-upscale=PATH|NAME|off vae_tiling=on|off model diffusion_model llm vae tokenizer lora_dir sd_cli \
-target=local|server url recipe hires_scale hires_denoise extra=\"--flag value\" (local only)";
+const SET_HELP: &str = "Every setting is also a command: /KEY VALUE sets it, a bare /KEY opens a menu or \
+shows it. /set KEY=VALUE ... changes several at once. Settings: size=WxH aspect=W:H width height \
+steps cfg sampler seed=N|random negative=\"...\" upscale=PATH|NAME|off vae_tiling=on|off \
+conv_direct=auto|on|off model diffusion_model llm vae tokenizer lora_dir sd_cli \
+target=local|server url recipe hires_scale hires_denoise extra=\"--flag value\"";
 
-const KEYS_HELP: &str = "bare / or /SETTING opens a menu · keys: Enter generate · ←/→ browse images (empty prompt) · Home/End first/last · \
-Esc cancel (and clear queue) · ↑/↓ prompt history · Tab complete · Ctrl+C quit";
+const KEYS: &[(&str, &str)] = &[
+    ("Enter", "generate (or run a /command)"),
+    (
+        "←/→",
+        "browse images when the prompt is empty; otherwise move the cursor",
+    ),
+    ("Home/End", "first/last image when the prompt is empty"),
+    (
+        "↑/↓",
+        "move between the prompt's lines, then prompt history",
+    ),
+    (
+        "Esc",
+        "cancel the running image and the queue; otherwise clear the input",
+    ),
+    ("Tab", "complete a /command"),
+    ("Ctrl+U", "clear the input"),
+    ("Ctrl+C", "quit"),
+];
+
+/// How long a non-error notice stays on the status line.
+const NOTICE_SECS: u64 = 6;
 
 struct Request {
     prompt: String,
@@ -108,11 +136,27 @@ struct Shown {
     protocol: StatefulProtocol,
 }
 
-enum LogKind {
+#[derive(Clone, Copy, PartialEq)]
+enum Tone {
     Info,
     Good,
     Bad,
-    Dim,
+}
+
+/// One-line message on the status line. Errors stay until Esc or the next submit.
+struct Notice {
+    tone: Tone,
+    text: String,
+    at: Instant,
+}
+
+/// Scrollable text that temporarily replaces the image (/help, /show, /config).
+struct Panel {
+    title: String,
+    lines: Vec<Line<'static>>,
+    scroll: u16,
+    /// Rows the panel had when last drawn, to keep scrolling in range.
+    rows: u16,
 }
 
 pub struct App {
@@ -137,7 +181,11 @@ pub struct App {
     history: Vec<String>,
     history_pos: Option<usize>,
 
-    log: Vec<(LogKind, String)>,
+    /// Width of the prompt box's text area when last drawn (for ↑/↓ across wrapped lines).
+    input_width: usize,
+
+    notice: Option<Notice>,
+    panel: Option<Panel>,
     running: Option<Running>,
     queue: VecDeque<Request>,
     tick: usize,
@@ -178,19 +226,21 @@ pub fn run(start: Start) -> Result<()> {
         cursor: 0,
         history: Vec::new(),
         history_pos: None,
-        log: Vec::new(),
+        input_width: 0,
+        notice: None,
+        panel: None,
         running: None,
         queue: VecDeque::new(),
         tick: 0,
         quit: false,
         menu: None,
     };
-    app.info(format!(
-        "sd · profile '{}' · images go to {} · /help for commands",
+    syslog::debug(&format!(
+        "started: profile '{}', images to {}, display {:?}",
         app.profile_name,
-        app.out_dir.display()
+        app.out_dir.display(),
+        app.picker.protocol_type()
     ));
-    app.dim(format!("display: {:?}", app.picker.protocol_type()));
     app.adopt_session();
     let result = app.main_loop(&mut terminal);
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
@@ -255,13 +305,10 @@ impl App {
         self.view = n.checked_sub(1);
         self.shown = None;
         self.unreadable = None;
-        if self.session.entries.is_empty() {
-            self.dim(format!("new session {}", self.session.id));
-        } else {
-            self.good(format!(
-                "resumed session {} · {} images from {} requests",
+        if !self.session.entries.is_empty() {
+            self.info(format!(
+                "resumed session {} · {n} images from {} requests",
                 self.session.id,
-                n,
                 self.session.entries.len()
             ));
         }
@@ -360,14 +407,6 @@ impl App {
                         r.progress = None;
                     }
                     Ok(Event::Progress { done, total }) => r.progress = Some((done, total)),
-                    Ok(Event::Log(l)) => {
-                        let kind = if l.starts_with("warning:") {
-                            LogKind::Dim
-                        } else {
-                            LogKind::Bad
-                        };
-                        self.log.push((kind, l));
-                    }
                     Ok(done @ (Event::Done { .. } | Event::Failed(_))) => {
                         finished = Some(done);
                         break;
@@ -388,9 +427,10 @@ impl App {
                 elapsed,
                 seed,
             } => {
-                self.good(format!(
-                    "saved {} · {:.0}s · seed {seed}",
-                    display_path(&path, &self.out_dir),
+                // The new image, its name and its time are on screen; nothing else to say.
+                syslog::info(&format!(
+                    "saved {} ({:.0}s, seed {seed})",
+                    path.display(),
                     elapsed.as_secs_f64()
                 ));
                 self.record(&r.request, "ok", |e| {
@@ -423,6 +463,9 @@ impl App {
             self.menu_key(key, ctrl);
             return;
         }
+        if self.panel.is_some() && self.panel_key(key) {
+            return;
+        }
         let empty = self.input.is_empty();
         match key.code {
             KeyCode::Char('c') if ctrl => self.quit = true,
@@ -434,8 +477,16 @@ impl App {
             KeyCode::Esc => self.on_escape(),
             KeyCode::Enter => self.submit(),
             KeyCode::Tab => self.complete(),
-            KeyCode::Up => self.history_step(-1),
-            KeyCode::Down => self.history_step(1),
+            KeyCode::Up => {
+                if !self.move_row(-1) {
+                    self.history_step(-1)
+                }
+            }
+            KeyCode::Down => {
+                if !self.move_row(1) {
+                    self.history_step(1)
+                }
+            }
             // With an empty prompt the arrows browse the session's images.
             KeyCode::Left if empty => self.browse(Browse::Prev),
             KeyCode::Right if empty => self.browse(Browse::Next),
@@ -484,6 +535,30 @@ impl App {
         self.history_pos = None;
     }
 
+    /// Keys for the open panel. Returns false for keys the panel doesn't use: those close it
+    /// and then do what they normally do, so typing a prompt just works.
+    fn panel_key(&mut self, key: KeyEvent) -> bool {
+        let Some(p) = self.panel.as_mut() else {
+            return false;
+        };
+        let max = (p.lines.len() as u16).saturating_sub(p.rows.max(1));
+        let page = p.rows.saturating_sub(1).max(1);
+        match key.code {
+            KeyCode::Up => p.scroll = p.scroll.saturating_sub(1),
+            KeyCode::Down => p.scroll = (p.scroll + 1).min(max),
+            KeyCode::PageUp => p.scroll = p.scroll.saturating_sub(page),
+            KeyCode::PageDown | KeyCode::Char(' ') => p.scroll = (p.scroll + page).min(max),
+            KeyCode::Home => p.scroll = 0,
+            KeyCode::End => p.scroll = max,
+            KeyCode::Esc | KeyCode::Enter => self.panel = None,
+            _ => {
+                self.panel = None;
+                return false;
+            }
+        }
+        true
+    }
+
     fn menu_key(&mut self, key: KeyEvent, ctrl: bool) {
         let Some(m) = self.menu.as_mut() else { return };
         match key.code {
@@ -504,6 +579,8 @@ impl App {
                     Action::Profile => format!("/profile {value}"),
                     Action::Resume => format!("/resume {value}"),
                     Action::Command => value,
+                    Action::File => format!("/file {value}"),
+                    Action::Batch => format!("/batch {value}"),
                 };
                 if let Err(e) = self.command(&line) {
                     self.bad(format!("{e:#}"));
@@ -534,6 +611,7 @@ impl App {
             };
             self.info(format!("cancelling \"{prompt}\"{extra}"));
         } else {
+            self.notice = None;
             self.input.clear();
             self.cursor = 0;
         }
@@ -544,6 +622,9 @@ impl App {
         self.input.clear();
         self.cursor = 0;
         self.history_pos = None;
+        if self.notice.as_ref().is_some_and(|n| n.tone == Tone::Bad) {
+            self.notice = None;
+        }
         if text.is_empty() {
             return;
         }
@@ -555,15 +636,17 @@ impl App {
                 self.bad(format!("{e:#}"));
             }
         } else {
-            if self.running.is_some() {
-                self.dim(format!("queued \"{}\"", ellipsize(&text, 50)));
-            }
-            self.queue.push_back(Request {
-                prompt: text,
-                profile_name: self.profile_name.clone(),
-                profile: self.profile.clone(),
-            });
+            // The status line shows the queue length; no message needed.
+            self.enqueue(text);
         }
+    }
+
+    fn enqueue(&mut self, prompt: String) {
+        self.queue.push_back(Request {
+            prompt,
+            profile_name: self.profile_name.clone(),
+            profile: self.profile.clone(),
+        });
     }
 
     fn complete(&mut self) {
@@ -580,11 +663,33 @@ impl App {
                 self.cursor = self.input.chars().count();
             }
             [] => {}
-            many => {
-                let names: Vec<_> = many.iter().map(|(c, _)| *c).collect();
-                self.dim(names.join("  "));
+            _ => {
+                // Several matches: the command menu, filtered by what was typed.
+                let mut m = menu::commands(COMMANDS);
+                self.input.chars().for_each(|ch| m.push(ch));
+                self.menu = Some(m);
+                self.input.clear();
+                self.cursor = 0;
             }
         }
+    }
+
+    /// Move the cursor to the wrapped line above/below, keeping its column. False when there's
+    /// no such line (then ↑/↓ step through history instead).
+    fn move_row(&mut self, dir: i32) -> bool {
+        let len = self.input.chars().count();
+        let starts = wrap_starts(&self.input, self.input_width);
+        let (row, col) = cursor_row_col(&starts, self.cursor, self.input_width);
+        let target = row as i64 + dir as i64;
+        if target < 0 || target as usize >= starts.len() {
+            return false;
+        }
+        let t = target as usize;
+        let row_end = starts
+            .get(t + 1)
+            .map_or(len, |&next| next.saturating_sub(1));
+        self.cursor = (starts[t] + col).min(row_end.max(starts[t]));
+        true
     }
 
     fn history_step(&mut self, dir: i32) {
@@ -610,29 +715,9 @@ impl App {
         let (cmd, rest) = text.split_once(' ').unwrap_or((text, ""));
         let rest = rest.trim();
         match cmd {
-            "/help" | "/h" | "/?" => {
-                for (c, d) in COMMANDS {
-                    self.dim(format!("{c:<10} {d}"));
-                }
-                self.dim(SET_HELP.to_string());
-                self.dim(KEYS_HELP.to_string());
-            }
+            "/help" | "/h" | "/?" => self.panel = Some(Panel::new("help", help_lines())),
             "/profiles" | "/ls" => {
-                let lines: Vec<String> = self
-                    .config
-                    .profiles
-                    .iter()
-                    .map(|(name, p)| {
-                        let mark = if *name == self.profile_name { "*" } else { " " };
-                        format!(
-                            "{mark} {name:<18} {}",
-                            p.description.clone().unwrap_or_else(|| p.summary())
-                        )
-                    })
-                    .collect();
-                for l in lines {
-                    self.info(l);
-                }
+                self.menu = Some(menu::profiles(&self.config, &self.profile_name))
             }
             "/" => self.menu = Some(menu::commands(COMMANDS)),
             "/profile" | "/p" => {
@@ -642,23 +727,29 @@ impl App {
                     self.profile = self.config.profile(rest)?;
                     self.profile_name = rest.to_string();
                     self.modified = false;
-                    self.good(format!("profile '{rest}': {}", self.profile.summary()));
+                    self.good(format!("profile '{rest}'"));
                 }
             }
             "/show" => {
                 let text = toml::to_string_pretty(&self.profile).context("formatting profile")?;
-                self.info(format!(
-                    "[profiles.{}]{}",
-                    self.profile_name,
-                    if self.modified { " (modified)" } else { "" }
-                ));
-                for l in text.lines() {
-                    self.dim(l.to_string());
-                }
+                let mut lines = vec![Line::from(
+                    format!(
+                        "[profiles.{}]{}",
+                        self.profile_name,
+                        if self.modified {
+                            "  # modified, /save to keep"
+                        } else {
+                            ""
+                        }
+                    )
+                    .fg(ACCENT),
+                )];
+                lines.extend(text.lines().map(|l| Line::from(l.to_string())));
+                self.panel = Some(Panel::new("/show", lines));
             }
             "/set" => {
                 if rest.is_empty() {
-                    self.info(SET_HELP.to_string());
+                    self.panel = Some(Panel::new("/set", vec![Line::from(SET_HELP)]));
                     return Ok(());
                 }
                 let words = shlex::split(rest)
@@ -671,11 +762,7 @@ impl App {
                     changed.push(self.profile.set(k.trim(), v)?);
                 }
                 self.modified = true;
-                self.good(format!(
-                    "{} · {}",
-                    changed.join(", "),
-                    self.profile.summary()
-                ));
+                self.good(changed.join(", "));
             }
             "/save" => {
                 let name = if rest.is_empty() {
@@ -735,22 +822,34 @@ impl App {
                     .stderr(std::process::Stdio::null())
                     .spawn()
                     .context("could not run xdg-open")?;
-                self.dim(format!("opened {}", path.display()));
             }
-            "/sessions" => {
-                let rows = session::list(&self.sessions_dir)?;
-                if rows.is_empty() {
-                    self.info("no saved sessions yet".into());
+            "/sessions" => return self.command("/resume"),
+            "/file" | "/batch" => {
+                let batch = cmd == "/batch";
+                if rest.is_empty() {
+                    let here = std::env::current_dir().unwrap_or_else(|_| self.out_dir.clone());
+                    let files = prompts::files_in(&here);
+                    anyhow::ensure!(
+                        !files.is_empty(),
+                        "usage: {cmd} PATH (no .txt files in {})",
+                        here.display()
+                    );
+                    self.menu = Some(menu::prompt_files(files, batch));
+                    return Ok(());
                 }
-                for s in rows.iter().take(15) {
-                    let mark = if s.id == self.session.id { "*" } else { " " };
-                    self.info(format!(
-                        "{mark} {:<17} {:>3} images {:>3} requests  \"{}\"",
-                        s.id,
-                        s.images,
-                        s.requests,
-                        ellipsize(&s.last_prompt, 40)
-                    ));
+                let text = prompts::read(rest)?;
+                if batch {
+                    let list = prompts::batch(&text);
+                    anyhow::ensure!(!list.is_empty(), "{rest} has no prompts in it");
+                    let n = list.len();
+                    list.into_iter().for_each(|p| self.enqueue(p));
+                    self.good(format!("queued {n} prompts from {rest}"));
+                } else {
+                    let prompt = prompts::one(&text);
+                    anyhow::ensure!(!prompt.is_empty(), "{rest} has no prompt in it");
+                    self.cursor = prompt.chars().count();
+                    self.input = prompt;
+                    self.info(format!("loaded {rest} · Enter generates"));
                 }
             }
             "/resume" => {
@@ -776,10 +875,23 @@ impl App {
                 self.adopt_session();
             }
             "/config" => {
-                self.info(format!("config: {}", self.config_path.display()));
-                self.info(format!("session: {}", self.session.file.display()));
+                let row = |k: &str, v: String| {
+                    Line::from(vec![
+                        Span::styled(format!("{k:<9}"), Style::default().fg(ACCENT)),
+                        Span::raw(v),
+                    ])
+                };
+                self.panel = Some(Panel::new(
+                    "/config",
+                    vec![
+                        row("config", self.config_path.display().to_string()),
+                        row("session", self.session.file.display().to_string()),
+                        row("images", self.out_dir.display().to_string()),
+                        row("display", format!("{:?}", self.picker.protocol_type())),
+                        row("logs", "journalctl -t sd".into()),
+                    ],
+                ));
             }
-            "/clear" => self.log.clear(),
             "/quit" | "/q" | "/exit" => self.quit = true,
             other => {
                 // Any setting works as a command: `/cfg 4.5`, `/seed random`; bare `/cfg` shows it.
@@ -796,53 +908,83 @@ impl App {
                 } else {
                     let changed = self.profile.set(key, rest)?;
                     self.modified = true;
-                    self.good(format!("{changed} · {}", self.profile.summary()));
+                    self.good(changed);
                 }
             }
         }
         Ok(())
     }
 
-    // ---- log --------------------------------------------------------------------------
+    // ---- notices --------------------------------------------------------------------
 
-    fn push(&mut self, kind: LogKind, s: String) {
-        self.log.push((kind, s));
-        if self.log.len() > 500 {
-            self.log.drain(..100);
+    fn notify(&mut self, tone: Tone, text: String) {
+        if tone == Tone::Bad {
+            syslog::err(&text);
         }
+        self.notice = Some(Notice {
+            tone,
+            text,
+            at: Instant::now(),
+        });
     }
     fn info(&mut self, s: String) {
-        self.push(LogKind::Info, s);
+        self.notify(Tone::Info, s);
     }
     fn good(&mut self, s: String) {
-        self.push(LogKind::Good, s);
+        self.notify(Tone::Good, s);
     }
     fn bad(&mut self, s: String) {
-        self.push(LogKind::Bad, s);
+        self.notify(Tone::Bad, s);
     }
-    fn dim(&mut self, s: String) {
-        self.push(LogKind::Dim, s);
+
+    /// The notice to show now, if it hasn't expired.
+    fn live_notice(&self) -> Option<&Notice> {
+        self.notice
+            .as_ref()
+            .filter(|n| n.tone == Tone::Bad || n.at.elapsed() < Duration::from_secs(NOTICE_SECS))
     }
 
     // ---- drawing ----------------------------------------------------------------------
 
     fn draw(&mut self, f: &mut Frame) {
-        let has_image = self.view.is_some();
-        let log_height = if has_image { 4 } else { 12 }
-            .min(f.area().height / 3)
-            .max(3);
-        let [image_area, log_area, status_area, input_area] = Layout::vertical([
+        let area = f.area();
+        // The prompt box grows with the prompt, up to a third of the screen.
+        self.input_width = area.width.saturating_sub(2) as usize;
+        let rows = input_rows(&self.input, self.cursor, self.input_width);
+        let max_rows = (area.height / 3).max(1) as usize;
+        let input_height = rows.clamp(1, max_rows) as u16 + 2;
+        let [image_area, status_area, input_area] = Layout::vertical([
             Constraint::Min(4),
-            Constraint::Length(log_height),
             Constraint::Length(1),
-            Constraint::Length(3),
+            Constraint::Length(input_height),
         ])
-        .areas(f.area());
+        .areas(area);
 
         self.draw_image(f, image_area);
-        self.draw_log(f, log_area);
         self.draw_status(f, status_area);
         self.draw_input(f, input_area);
+    }
+
+    fn draw_panel(&mut self, f: &mut Frame, area: Rect) {
+        let Some(p) = self.panel.as_mut() else { return };
+        let block = Block::default()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::default().fg(Color::Cyan))
+            .title(Span::styled(
+                format!(" {} ", p.title),
+                Style::default().fg(Color::Cyan),
+            ))
+            .title_bottom(Line::from(" ↑/↓ PgUp/PgDn scroll · Esc close ".dim()));
+        let inner = pad(block.inner(area));
+        f.render_widget(block, area);
+        p.rows = inner.height;
+        f.render_widget(
+            Paragraph::new(p.lines.clone())
+                .wrap(Wrap { trim: false })
+                .scroll((p.scroll, 0)),
+            inner,
+        );
     }
 
     fn draw_menu(&self, f: &mut Frame, area: Rect) {
@@ -920,6 +1062,10 @@ impl App {
             self.draw_menu(f, area);
             return;
         }
+        if self.panel.is_some() {
+            self.draw_panel(f, area);
+            return;
+        }
         let count = self.session.images().len();
         let entry = self.viewed().cloned();
         let mut block = Block::default()
@@ -942,10 +1088,14 @@ impl App {
                     ),
                     Style::default().fg(ACCENT),
                 ));
-                // The prompt that made this image, then its seed and profile.
+                // The prompt that made this image, then its seed, profile and time.
                 let width = area.width.saturating_sub(6) as usize;
+                let secs = e
+                    .elapsed_s
+                    .map(|s| format!(" · {s:.0}s"))
+                    .unwrap_or_default();
                 let tail = format!(
-                    " · seed {} · {}",
+                    " · seed {} · {}{secs}",
                     e.seed.map_or("?".into(), |s| s.to_string()),
                     e.profile
                 );
@@ -991,49 +1141,14 @@ impl App {
                         )
                         .dim(),
                     ),
-                    Line::from(
-                        "/help for commands · /profiles to switch · /sessions to resume".dim(),
-                    ),
+                    Line::from("/ for commands · /file or /batch to load prompts · /help".dim()),
                 ];
                 center_text(f, inner, hello);
             }
         }
     }
 
-    fn draw_log(&self, f: &mut Frame, area: Rect) {
-        let start = self.log.len().saturating_sub(area.height as usize);
-        let lines: Vec<Line> = self.log[start..]
-            .iter()
-            .map(|(kind, s)| {
-                let style = match kind {
-                    LogKind::Info => Style::default(),
-                    LogKind::Good => Style::default().fg(Color::Green),
-                    LogKind::Bad => Style::default().fg(Color::Red),
-                    LogKind::Dim => Style::default().fg(Color::DarkGray),
-                };
-                Line::from(Span::styled(s.clone(), style))
-            })
-            .collect();
-        f.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), pad(area));
-    }
-
     fn draw_status(&self, f: &mut Frame, area: Rect) {
-        let name = format!(
-            " {}{} ",
-            self.profile_name,
-            if self.modified { "*" } else { "" }
-        );
-        let left = Line::from(vec![
-            Span::styled(
-                name,
-                Style::default()
-                    .fg(Color::Black)
-                    .bg(ACCENT)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::raw(" "),
-            Span::styled(self.profile.summary(), Style::default().fg(Color::DarkGray)),
-        ]);
         let right = match &self.running {
             Some(r) => {
                 let spin = SPINNER[self.tick % SPINNER.len()];
@@ -1052,16 +1167,48 @@ impl App {
                     r.started.elapsed().as_secs_f64()
                 )
             }
-            None => format!("session {} ", self.session.id),
+            None => String::new(),
         };
-        f.render_widget(Paragraph::new(left), area);
+        let right_width = right.chars().count() as u16;
+        let left_area = Rect {
+            width: area.width.saturating_sub(right_width + 1),
+            ..area
+        };
+        let name = format!(
+            " {}{} ",
+            self.profile_name,
+            if self.modified { "*" } else { "" }
+        );
+        let room = (left_area.width as usize).saturating_sub(name.chars().count() + 1);
+        // A notice takes the place of the settings summary while it's fresh.
+        let detail = match self.live_notice() {
+            Some(n) => Span::styled(
+                ellipsize(&n.text, room),
+                Style::default().fg(match n.tone {
+                    Tone::Info => Color::White,
+                    Tone::Good => Color::Green,
+                    Tone::Bad => Color::Red,
+                }),
+            ),
+            None => Span::styled(
+                ellipsize(&self.profile.summary(), room),
+                Style::default().fg(Color::DarkGray),
+            ),
+        };
+        let left = Line::from(vec![
+            Span::styled(
+                name,
+                Style::default()
+                    .fg(Color::Black)
+                    .bg(ACCENT)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::raw(" "),
+            detail,
+        ]);
+        f.render_widget(Paragraph::new(left), left_area);
         f.render_widget(
-            Paragraph::new(Line::from(right.fg(if self.running.is_some() {
-                ACCENT
-            } else {
-                Color::DarkGray
-            })))
-            .alignment(Alignment::Right),
+            Paragraph::new(Line::from(right.fg(ACCENT))).alignment(Alignment::Right),
             area,
         );
     }
@@ -1076,13 +1223,105 @@ impl App {
             .title(title);
         let inner = block.inner(area);
         f.render_widget(block, area);
-        // Scroll horizontally so the cursor stays visible.
-        let width = inner.width.saturating_sub(1) as usize;
-        let skip = self.cursor.saturating_sub(width);
-        let visible: String = self.input.chars().skip(skip).take(width + 1).collect();
-        f.render_widget(Paragraph::new(visible), inner);
-        f.set_cursor_position((inner.x + (self.cursor - skip) as u16, inner.y));
+        let width = inner.width as usize;
+        let chars: Vec<char> = self.input.chars().collect();
+        let starts = wrap_starts(&self.input, width);
+        let (row, col) = cursor_row_col(&starts, self.cursor, width);
+        // Scroll so the cursor's line is visible when the prompt outgrows the box.
+        let height = inner.height as usize;
+        let top = row.saturating_sub(height.saturating_sub(1));
+        let lines: Vec<Line> = (top..starts.len())
+            .take(height)
+            .map(|i| {
+                let end = starts.get(i + 1).copied().unwrap_or(chars.len());
+                Line::from(chars[starts[i]..end].iter().collect::<String>())
+            })
+            .collect();
+        f.render_widget(Paragraph::new(lines), inner);
+        f.set_cursor_position((inner.x + col as u16, inner.y + (row - top) as u16));
     }
+}
+
+impl Panel {
+    fn new(title: &str, lines: Vec<Line<'static>>) -> Panel {
+        Panel {
+            title: title.to_string(),
+            lines,
+            scroll: 0,
+            rows: 0,
+        }
+    }
+}
+
+fn help_lines() -> Vec<Line<'static>> {
+    let heading = |s: &'static str| Line::from(s.fg(Color::Cyan).bold());
+    let row = |k: &str, v: &str, w: usize| {
+        Line::from(vec![
+            Span::styled(format!("  {k:<w$} "), Style::default().fg(ACCENT)),
+            Span::raw(v.to_string()),
+        ])
+    };
+    let mut lines = vec![
+        heading("Commands"),
+        Line::from("  a bare command opens a menu of values".dim()),
+    ];
+    lines.extend(COMMANDS.iter().map(|(c, d)| row(c, d, 9)));
+    lines.push(Line::from(""));
+    lines.push(heading("Keys"));
+    lines.extend(KEYS.iter().map(|(k, d)| row(k, d, 9)));
+    lines.push(Line::from(""));
+    lines.push(heading("Settings"));
+    lines.push(Line::from(format!("  {SET_HELP}")));
+    lines.push(Line::from(""));
+    lines.push(heading("Prompt files"));
+    lines.push(Line::from(
+        "  /file reads one prompt (lines joined); /batch queues one image per line. Blank lines and # lines are skipped. From the shell: sd -f FILE, sd -b FILE.",
+    ));
+    lines.push(Line::from(""));
+    lines.push(Line::from(
+        "  Warnings and errors from sd-cli are in the system log: journalctl -t sd".dim(),
+    ));
+    lines
+}
+
+/// Where each line of `text` starts (in chars) when word-wrapped to `width` columns. Lines
+/// break after a space when there is one; a word longer than the line is split.
+fn wrap_starts(text: &str, width: usize) -> Vec<usize> {
+    let chars: Vec<char> = text.chars().collect();
+    let mut starts = vec![0];
+    if width == 0 {
+        return starts;
+    }
+    let mut start = 0;
+    while chars.len() - start > width {
+        let limit = start + width;
+        let brk = (start + 1..limit)
+            .rev()
+            .find(|&i| chars[i] == ' ')
+            .map_or(limit, |i| i + 1);
+        starts.push(brk);
+        start = brk;
+    }
+    starts
+}
+
+/// The cursor's wrapped line and column. A cursor just past a full last line goes to the
+/// start of an extra line below it.
+fn cursor_row_col(starts: &[usize], cursor: usize, width: usize) -> (usize, usize) {
+    let row = starts.partition_point(|&s| s <= cursor).saturating_sub(1);
+    let col = cursor - starts[row];
+    if width > 0 && col >= width {
+        (row + 1, col - width)
+    } else {
+        (row, col)
+    }
+}
+
+/// Lines the prompt box needs for `text` with the cursor at `cursor`.
+fn input_rows(text: &str, cursor: usize, width: usize) -> usize {
+    let starts = wrap_starts(text, width);
+    let (row, _) = cursor_row_col(&starts, cursor, width);
+    starts.len().max(row + 1)
 }
 
 enum Browse {
@@ -1185,6 +1424,25 @@ mod tests {
     fn byte_index_handles_multibyte() {
         assert_eq!(byte_index("héllo", 2), 3);
         assert_eq!(byte_index("abc", 9), 3);
+    }
+
+    #[test]
+    fn long_prompts_wrap_at_spaces() {
+        // "aaaa bbbb cccc" in 6 columns: "aaaa ", "bbbb ", "cccc"
+        assert_eq!(wrap_starts("aaaa bbbb cccc", 6), vec![0, 5, 10]);
+        // a word longer than the line is split
+        assert_eq!(wrap_starts("abcdefghij", 4), vec![0, 4, 8]);
+        assert_eq!(wrap_starts("short", 20), vec![0]);
+    }
+
+    #[test]
+    fn cursor_moves_to_a_new_line_after_a_full_one() {
+        let starts = wrap_starts("abcd", 4);
+        assert_eq!(cursor_row_col(&starts, 4, 4), (1, 0));
+        assert_eq!(input_rows("abcd", 4, 4), 2);
+        assert_eq!(input_rows("abcd", 2, 4), 1);
+        let starts = wrap_starts("aaaa bbbb cccc", 6);
+        assert_eq!(cursor_row_col(&starts, 7, 6), (1, 2));
     }
 
     #[test]

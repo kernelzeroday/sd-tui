@@ -10,6 +10,8 @@ sd                         # open the interface (new session)
 sd --resume                # continue the most recent session
 sd --resume 20261123-2025  # continue a specific session
 sd "a fox in the snow"     # one image, no interface; prints the file path
+sd -f prompt.txt           # one image from a prompt file (its lines are joined)
+sd -b prompts.txt          # one image per line of a file (prints each path)
 sd -p remote "a fox"       # with a specific profile
 sd --list                  # profiles
 sd --sessions              # recent sessions
@@ -18,20 +20,27 @@ sd --sessions              # recent sessions
 ## The interface
 
 - Each line you type is an image request. Requests typed while one is rendering are queued.
-- The image pane shows the session's images; the prompt that made the shown image, its seed and
-  profile are on the pane's bottom edge. ←/→ browse (when the prompt is empty), Home/End jump to
+- The prompt box wraps long prompts and grows taller as you type (up to a third of the screen);
+  ↑/↓ move between its lines.
+- The image pane shows the session's images; the file name is on its top edge, and the prompt
+  that made it, its seed, profile and generation time on the bottom edge. ←/→ browse (when the prompt is empty), Home/End jump to
   the first/last.
 - Images are shown with the kitty graphics protocol (Ghostty, kitty), sixel, iTerm2, or block
   characters, whichever the terminal supports.
 - Images are saved as `sd-YYYYmmdd-HHMMSS-sSEED.png` in the current folder (or `-o DIR`).
 - Pasting multi-line text joins the lines with spaces; a paste never starts a generation.
+- The status line shows the profile, progress and the queue. Short messages appear there for a
+  few seconds (errors stay until Esc or the next prompt); `/help`, `/show` and `/config` open a
+  scrollable panel in place of the image (Esc closes it, typing goes back to the prompt).
+- sd-cli's warnings and errors, and the interface's own errors, go to the system log rather than
+  the screen: `journalctl -t sd` (add `-f` to follow). A failed image's error is also shown.
 
 | Key | Action |
 | --- | --- |
 | Enter | generate (or run a /command) |
 | ←/→, Home/End | browse images (empty prompt); otherwise move the cursor |
 | Esc | cancel the running image and clear the queue; otherwise clear the input |
-| ↑/↓ | prompt history (restored when resuming a session) |
+| ↑/↓ | move between the prompt's lines, then prompt history (restored when resuming) |
 | Tab | complete a /command |
 | Ctrl+U | clear the input |
 | Ctrl+C | quit |
@@ -50,6 +59,8 @@ typed text. `/` on its own opens a menu of all commands.
 | `/seed N`, `/seed random` | fixed seed or a new one per image (the menu offers the shown image's seed) |
 | `/sampler NAME` | `euler`, `euler_a`, `er_sde`, `dpm++2m`, ... |
 | `/neg TEXT`, `/neg off` | negative prompt |
+| `/file PATH` | load a prompt from a text file into the input, to edit or press Enter |
+| `/batch PATH` | queue one image per line of a text file |
 | `/upscale PATH\|NAME\|off` | upscale after generating (see Profiles) |
 | `/profile NAME`, `/profiles` | switch / list profiles |
 | `/show` | all current settings, as TOML |
@@ -58,12 +69,21 @@ typed text. `/` on its own opens a menu of all commands.
 | `/load PATH`, `/reload` | load another config file / re-read this one |
 | `/reuse` | put the shown image's prompt in the input to edit |
 | `/open` | open the shown image with `xdg-open` |
-| `/sessions`, `/resume [ID]`, `/new` | list, switch to, or start sessions |
-| `/config`, `/clear`, `/help`, `/quit` | |
+| `/resume [ID]`, `/new` | switch to (a menu of recent sessions) or start a session |
+| `/config`, `/help`, `/quit` | file paths and log location; commands and keys |
 
 Every profile setting also works as `/KEY VALUE` (bare `/KEY` shows it or opens its menu):
-`width height vae_tiling hires_scale hires_denoise model diffusion_model llm vae tokenizer lora_dir
+`width height vae_tiling conv_direct hires_scale hires_denoise model diffusion_model llm vae tokenizer lora_dir
 sd_cli target url recipe extra`.
+
+## Prompt files
+
+Plain text. `/file` and `sd -f` treat the whole file as one prompt, joining its lines with
+spaces, so a long prompt can be wrapped however you like. `/batch` and `sd -b` make one image
+per line. In both, blank lines and lines starting with `#` are skipped. A bare `/file` or
+`/batch` offers the `.txt` files in the current folder; `-` reads standard input
+(`sd -b - < prompts.txt`). A one-shot batch keeps going past a failed image and exits non-zero
+at the end if any failed.
 
 ## Sessions
 
@@ -103,7 +123,8 @@ sampler = "euler"
 seed = -1                       # -1 = random per image (the seed goes in the file name)
 upscale = "~/models/sd-models/upscale_models/RealESRGAN_x4plus_anime_6B.pth"   # plain ESRGAN x4
 # also: model (single-file checkpoint, -m), tokenizer, lora_dir (for <lora:NAME:W> in prompts),
-# negative, vae_tiling, extra = ["--flag", "value"]
+# negative, vae_tiling, extra = ["--flag", "value"],
+# conv_direct = "auto" | "on" | "off"   (sd-cli --conv-direct; see Troubleshooting)
 ```
 
 ### Server profiles (`target = "server"`)
@@ -143,8 +164,10 @@ supported on server profiles yet (the API wants a structured list, not prompt ta
   refuses to load weights when the system's available memory drops under 1 GiB. On
   unified-memory machines (Apple silicon) the GPU copy counts against RAM too, so another
   sd-server/sd-cli or a big browser can tip it over. `sd` adds this hint to the error.
-- `conv2d/conv3d direct auto: Vulkan0 -> off (probe output check failed)`: harmless. sd.cpp
-  self-tests a faster Vulkan kernel and falls back to the standard one. Shown dimmed.
+- `conv2d/conv3d direct auto: Vulkan0 -> off (probe output check failed)` in the system log:
+  harmless. On every run sd.cpp self-tests a faster direct-convolution Vulkan kernel and, if
+  its output is wrong on this GPU (as on Asahi), uses the standard one. Set
+  `conv_direct = "off"` in local profiles to skip the probe and the warning.
 - Keys typed in the first moment after start can be swallowed while the image library asks the
   terminal which graphics protocol it supports (only in terminals that never answer).
 
@@ -152,8 +175,10 @@ supported on server profiles yet (the API wants a structured list, not prompt ta
 
 ```sh
 cargo build --release          # binary: target/release/sd
-cargo install --path .         # -> ~/.cargo/bin/sd
 cargo test
+packaging/rpm.sh               # RPM -> target/rpmbuild/RPMS/<arch>/
+packaging/rpm.sh --install     # build, then install it with pkexec dnf (-> /usr/bin/sd)
+cargo install --path .         # or without packaging: -> ~/.cargo/bin/sd
 ```
 
 Needs `sd-cli` (local profiles) or a reachable `sd-server` (server profiles).

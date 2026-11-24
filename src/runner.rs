@@ -30,8 +30,6 @@ pub enum Event {
         done: u32,
         total: u32,
     },
-    /// Warning or error line worth showing.
-    Log(String),
     Done {
         path: PathBuf,
         elapsed: Duration,
@@ -86,7 +84,13 @@ pub fn start(profile: Profile, prompt: String, out_dir: PathBuf, tx: Sender<Even
                 elapsed: started.elapsed(),
                 seed,
             },
-            Err(e) => Event::Failed(explain(format!("{e:#}"))),
+            Err(e) => {
+                let msg = explain(format!("{e:#}"));
+                if msg != "cancelled" {
+                    crate::syslog::err(&format!("generation failed: {msg}"));
+                }
+                Event::Failed(msg)
+            }
         });
     });
     job
@@ -104,7 +108,6 @@ pub fn run_blocking(profile: Profile, prompt: String, out_dir: PathBuf) -> Resul
                 eprintln!("  {s}");
                 last_stage = s;
             }
-            Event::Log(l) => eprintln!("  {l}"),
             Event::Done {
                 path,
                 elapsed,
@@ -157,6 +160,9 @@ fn gen_args(p: &Profile, prompt: &str, seed: i64, out: &str) -> Vec<String> {
     ]);
     if p.vae_tiling {
         a.push("--vae-tiling".into());
+    }
+    if let Some(mode) = &p.conv_direct {
+        a.extend(["--conv-direct".into(), mode.clone()]);
     }
     a.extend(p.extra.iter().cloned());
     a.extend(["-o".into(), out.into()]);
@@ -276,7 +282,8 @@ impl Runner {
         .map(|stream| {
             let tx = self.tx.clone();
             let errors = errors.clone();
-            thread::spawn(move || pump(stream, &tx, &errors))
+            let program = program.clone();
+            thread::spawn(move || pump(stream, &program, &tx, &errors))
         })
         .collect();
         *self.child.lock().unwrap() = Some(child);
@@ -322,9 +329,7 @@ impl Runner {
         let mut resp = agent
             .post(&format!("{base}/sdcpp/v1/img_gen"))
             .send_json(&body)
-            .map_err(|e| {
-                anyhow!("can't reach sd-server at {base}: {e} (is it running?)")
-            })?;
+            .map_err(|e| anyhow!("can't reach sd-server at {base}: {e} (is it running?)"))?;
         let status = resp.status().as_u16();
         let submitted: Value = resp.body_mut().read_json().unwrap_or(Value::Null);
         if status != 202 && status != 200 {
@@ -493,7 +498,12 @@ fn api_error(v: &Value) -> String {
 // ---- sd-cli output parsing --------------------------------------------------------------------
 
 /// Read a child's output, splitting on \r as well as \n (sd-cli redraws progress bars with \r).
-fn pump(mut stream: Box<dyn Read + Send>, tx: &Sender<Event>, errors: &Mutex<Vec<String>>) {
+fn pump(
+    mut stream: Box<dyn Read + Send>,
+    program: &str,
+    tx: &Sender<Event>,
+    errors: &Mutex<Vec<String>>,
+) {
     let mut buf = [0u8; 4096];
     let mut line = Vec::new();
     loop {
@@ -503,7 +513,7 @@ fn pump(mut stream: Box<dyn Read + Send>, tx: &Sender<Event>, errors: &Mutex<Vec
         };
         for &b in &buf[..n] {
             if b == b'\n' || b == b'\r' {
-                handle_line(&String::from_utf8_lossy(&line), tx, errors);
+                handle_line(&String::from_utf8_lossy(&line), program, tx, errors);
                 line.clear();
             } else {
                 line.push(b);
@@ -511,29 +521,36 @@ fn pump(mut stream: Box<dyn Read + Send>, tx: &Sender<Event>, errors: &Mutex<Vec
         }
     }
     if !line.is_empty() {
-        handle_line(&String::from_utf8_lossy(&line), tx, errors);
+        handle_line(&String::from_utf8_lossy(&line), program, tx, errors);
     }
 }
 
-fn handle_line(raw: &str, tx: &Sender<Event>, errors: &Mutex<Vec<String>>) {
+/// Progress and info lines drive the status line. Warnings and errors go to the system log;
+/// errors are also kept for the failure message if the command fails, which is when they
+/// matter. (sd.cpp warnings are things like "conv2d direct auto: Vulkan0 -> off (probe output
+/// check failed)": a faster kernel failed its self-test and the standard one is used.)
+fn handle_line(raw: &str, program: &str, tx: &Sender<Event>, errors: &Mutex<Vec<String>>) {
     let line = strip_ansi(raw);
     let line = line.trim();
     if line.is_empty() {
         return;
     }
+    let name = Path::new(program)
+        .file_name()
+        .map_or(program.into(), |n| n.to_string_lossy());
     if let Some((done, total)) = parse_progress(line) {
         let _ = tx.send(Event::Progress { done, total });
     } else if let Some(msg) = line.strip_prefix("[E]") {
         let msg = shorten(msg);
-        errors.lock().unwrap().push(msg.clone());
-        let _ = tx.send(Event::Log(format!("error: {msg}")));
+        crate::syslog::err(&format!("{name}: {msg}"));
+        errors.lock().unwrap().push(msg);
     } else if let Some(msg) = line.strip_prefix("[W]") {
-        let _ = tx.send(Event::Log(format!("warning: {}", shorten(msg))));
+        crate::syslog::warning(&format!("{name}: {}", shorten(msg)));
     } else if let Some(msg) = line.strip_prefix("[I]") {
         let _ = tx.send(Event::Stage(shorten(msg)));
     } else if line.contains("rror") {
+        crate::syslog::err(&format!("{name}: {line}"));
         errors.lock().unwrap().push(line.to_string());
-        let _ = tx.send(Event::Log(line.to_string()));
     }
 }
 
