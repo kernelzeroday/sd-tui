@@ -40,7 +40,7 @@ sd --sessions              # recent sessions
 | Enter | generate (or run a /command) |
 | ←/→, Home/End | browse images (empty prompt); otherwise move the cursor |
 | Esc | cancel the running image and clear the queue; otherwise clear the input |
-| ↑/↓ | move between the prompt's lines, then prompt history (restored when resuming) |
+| ↑/↓ | move between the prompt's lines, then prompt history (kept across sessions) |
 | Tab | complete a /command, or a file path after `/file`, `/batch`, `/load`, `/upscale`, ... |
 | Ctrl+U | clear the input |
 | Ctrl+C | clear the input; press twice in quick succession to quit (Ctrl+D twice also quits, on an empty prompt) |
@@ -90,7 +90,12 @@ at the end if any failed.
 Every request is appended to `~/.local/share/sd-tui/sessions/<id>.jsonl`: time, prompt, profile,
 the full settings, seed, image path, generation time, and whether it succeeded, failed or was
 cancelled. Resuming a session restores its image gallery and prompt history and keeps appending
-to the same file. One-shot `sd "prompt"` runs are logged to `sessions/cli.jsonl`.
+to the same file. One-shot `sd "prompt"` runs are logged to `sessions/cli.jsonl`. On quitting,
+sd prints the `sd --resume <id>` command for the session it was in.
+
+Everything typed at the prompt (prompts and commands) is also saved to
+`~/.local/share/sd-tui/history`, shared by all sessions like a shell's history, so ↑ reaches
+prompts from earlier sessions too. The last 1000 entries are kept.
 
 ## Profiles
 

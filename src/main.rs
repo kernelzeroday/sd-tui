@@ -7,6 +7,7 @@
 //! reads that prompt from a file and `-b FILE` generates one image per line of a file.
 
 mod config;
+mod history;
 mod menu;
 mod prompts;
 mod runner;

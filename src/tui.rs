@@ -28,6 +28,7 @@ use ratatui_image::{
 
 use crate::{
     config::{Config, Profile},
+    history,
     menu::{self, Action, Menu},
     prompts,
     runner::{self, Event, Job},
@@ -213,6 +214,11 @@ pub struct App {
     /// shrinks back once the prompt is a single row (or much shorter), so typing across a
     /// line break doesn't resize — and redraw — the image every time.
     input_box_rows: usize,
+    /// Set once a prompt has taken more than three rows; from then on the box keeps its
+    /// size for the rest of the session instead of shrinking back.
+    input_box_sticky: bool,
+    /// Where typed prompts and commands are saved for later sessions (None if unknown).
+    history_file: Option<PathBuf>,
 
     notice: Option<Notice>,
     panel: Option<Panel>,
@@ -260,6 +266,8 @@ pub fn run(start: Start) -> Result<()> {
         history_pos: None,
         input_width: 0,
         input_box_rows: 1,
+        input_box_sticky: false,
+        history_file: history::file().ok(),
         notice: None,
         panel: None,
         running: None,
@@ -279,6 +287,9 @@ pub fn run(start: Start) -> Result<()> {
     let result = app.main_loop(&mut terminal);
     let _ = crossterm::execute!(std::io::stdout(), crossterm::event::DisableBracketedPaste);
     ratatui::restore();
+    if !app.session.entries.is_empty() {
+        println!("resume this session with: sd --resume {}", app.session.id);
+    }
     result
 }
 
@@ -327,13 +338,22 @@ impl App {
     /// Show the newest image of the (possibly resumed) session and load its prompts into the
     /// history.
     fn adopt_session(&mut self) {
-        self.history = self
-            .session
-            .entries
-            .iter()
-            .map(|e| e.prompt.clone())
-            .collect();
+        // Everything typed in earlier sessions, then any of this session's prompts that
+        // aren't in it (a session from before the shared history existed).
+        self.history = match &self.history_file {
+            Some(path) => history::load(path).unwrap_or_else(|e| {
+                syslog::err(&format!("couldn't read the prompt history: {e:#}"));
+                Vec::new()
+            }),
+            None => Vec::new(),
+        };
+        for e in &self.session.entries {
+            if !self.history.contains(&e.prompt) {
+                self.history.push(e.prompt.clone());
+            }
+        }
         self.history.dedup();
+        self.input_box_sticky = false;
         self.history_pos = None;
         let n = self.session.images().len();
         self.view = n.checked_sub(1);
@@ -673,6 +693,11 @@ impl App {
         }
         if self.history.last() != Some(&text) {
             self.history.push(text.clone());
+            if let Some(path) = &self.history_file
+                && let Err(e) = history::append(path, &text)
+            {
+                syslog::err(&format!("couldn't save the prompt history: {e:#}"));
+            }
         }
         if text.starts_with('/') {
             if let Err(e) = self.command(&text) {
@@ -1052,7 +1077,8 @@ impl App {
         self.input_width = area.width.saturating_sub(2) as usize;
         let rows = input_rows(&self.input, self.cursor, self.input_width);
         let max_rows = (area.height / 3).max(1) as usize;
-        self.input_box_rows = box_rows(rows, self.input_box_rows);
+        self.input_box_sticky |= rows > STICKY_ROWS;
+        self.input_box_rows = box_rows(rows, self.input_box_rows, self.input_box_sticky);
         let input_height = self.input_box_rows.clamp(1, max_rows) as u16 + 2;
         let [image_area, status_area, input_area] = Layout::vertical([
             Constraint::Min(4),
@@ -1500,14 +1526,25 @@ fn center_text(f: &mut Frame, inner: Rect, lines: Vec<Line>) {
     );
 }
 
+/// A prompt taller than this makes the prompt box keep its size for the session.
+const STICKY_ROWS: usize = 3;
+
 /// Prompt box height (in text rows) for a prompt of `rows` rows, given the current height.
-/// Headroom of two rows is added when growing; the box shrinks only when the prompt fits one
-/// row, or when it has shrunk well below the box (more than double the headroom spare).
-fn box_rows(rows: usize, current: usize) -> usize {
+/// Up to two rows the box fits the prompt exactly. From three rows it grows with two spare
+/// rows, so the next lines don't resize it. A sticky box never shrinks; otherwise it shrinks
+/// to fit a prompt of one or two rows, or when the prompt has dropped well below the box
+/// (more than double the headroom spare).
+fn box_rows(rows: usize, current: usize, sticky: bool) -> usize {
     const HEADROOM: usize = 2;
     let rows = rows.max(1);
-    if rows == 1 {
-        1
+    if sticky {
+        if rows > current {
+            rows + HEADROOM
+        } else {
+            current
+        }
+    } else if rows <= 2 {
+        rows
     } else if rows > current || rows + 2 * HEADROOM < current {
         rows + HEADROOM
     } else {
@@ -1571,14 +1608,18 @@ mod tests {
 
     #[test]
     fn box_rows_has_headroom() {
-        assert_eq!(box_rows(1, 1), 1);
-        assert_eq!(box_rows(2, 1), 4); // first wrap: grow with two spare rows
-        assert_eq!(box_rows(3, 4), 4);
-        assert_eq!(box_rows(4, 4), 4); // fills the spare rows without resizing
-        assert_eq!(box_rows(5, 4), 7);
-        assert_eq!(box_rows(3, 7), 7); // small deletions keep the size
-        assert_eq!(box_rows(2, 7), 4); // a big drop shrinks
-        assert_eq!(box_rows(1, 7), 1); // back to one line
+        assert_eq!(box_rows(1, 1, false), 1);
+        assert_eq!(box_rows(2, 1, false), 2); // two rows fit exactly, no spare rows
+        assert_eq!(box_rows(3, 2, false), 5); // from three rows: grow with two spare rows
+        assert_eq!(box_rows(5, 5, false), 5); // fills the spare rows without resizing
+        assert_eq!(box_rows(6, 5, false), 8);
+        assert_eq!(box_rows(4, 8, false), 8); // small deletions keep the size
+        assert_eq!(box_rows(3, 8, false), 5); // a big drop shrinks
+        assert_eq!(box_rows(2, 8, false), 2); // two rows or fewer fit exactly
+        assert_eq!(box_rows(1, 8, false), 1);
+        // After a prompt taller than three rows, the box only grows.
+        assert_eq!(box_rows(1, 6, true), 6);
+        assert_eq!(box_rows(7, 6, true), 9);
     }
 
     #[test]
