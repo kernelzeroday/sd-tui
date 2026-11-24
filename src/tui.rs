@@ -209,6 +209,10 @@ pub struct App {
 
     /// Width of the prompt box's text area when last drawn (for ↑/↓ across wrapped lines).
     input_width: usize,
+    /// Text rows the prompt box currently has. It grows with two rows to spare and only
+    /// shrinks back once the prompt is a single row (or much shorter), so typing across a
+    /// line break doesn't resize — and redraw — the image every time.
+    input_box_rows: usize,
 
     notice: Option<Notice>,
     panel: Option<Panel>,
@@ -255,6 +259,7 @@ pub fn run(start: Start) -> Result<()> {
         history: Vec::new(),
         history_pos: None,
         input_width: 0,
+        input_box_rows: 1,
         notice: None,
         panel: None,
         running: None,
@@ -1047,7 +1052,8 @@ impl App {
         self.input_width = area.width.saturating_sub(2) as usize;
         let rows = input_rows(&self.input, self.cursor, self.input_width);
         let max_rows = (area.height / 3).max(1) as usize;
-        let input_height = rows.clamp(1, max_rows) as u16 + 2;
+        self.input_box_rows = box_rows(rows, self.input_box_rows);
+        let input_height = self.input_box_rows.clamp(1, max_rows) as u16 + 2;
         let [image_area, status_area, input_area] = Layout::vertical([
             Constraint::Min(4),
             Constraint::Length(1),
@@ -1494,6 +1500,21 @@ fn center_text(f: &mut Frame, inner: Rect, lines: Vec<Line>) {
     );
 }
 
+/// Prompt box height (in text rows) for a prompt of `rows` rows, given the current height.
+/// Headroom of two rows is added when growing; the box shrinks only when the prompt fits one
+/// row, or when it has shrunk well below the box (more than double the headroom spare).
+fn box_rows(rows: usize, current: usize) -> usize {
+    const HEADROOM: usize = 2;
+    let rows = rows.max(1);
+    if rows == 1 {
+        1
+    } else if rows > current || rows + 2 * HEADROOM < current {
+        rows + HEADROOM
+    } else {
+        current
+    }
+}
+
 /// Largest area with the image's aspect ratio that fits `area`, centered.
 fn centered(area: Rect, dims: (u32, u32), font: (u16, u16)) -> Rect {
     let (fw, fh) = (font.0.max(1) as f64, font.1.max(1) as f64);
@@ -1547,6 +1568,18 @@ fn display_path(path: &Path, base: &Path) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn box_rows_has_headroom() {
+        assert_eq!(box_rows(1, 1), 1);
+        assert_eq!(box_rows(2, 1), 4); // first wrap: grow with two spare rows
+        assert_eq!(box_rows(3, 4), 4);
+        assert_eq!(box_rows(4, 4), 4); // fills the spare rows without resizing
+        assert_eq!(box_rows(5, 4), 7);
+        assert_eq!(box_rows(3, 7), 7); // small deletions keep the size
+        assert_eq!(box_rows(2, 7), 4); // a big drop shrinks
+        assert_eq!(box_rows(1, 7), 1); // back to one line
+    }
 
     #[test]
     fn centered_keeps_aspect() {
