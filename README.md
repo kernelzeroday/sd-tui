@@ -61,6 +61,7 @@ typed text. `/` on its own opens a menu of all commands.
 | `/neg TEXT`, `/neg off` | negative prompt |
 | `/file PATH` | load a prompt from a text file into the input, to edit or press Enter |
 | `/batch PATH` | queue one image per line of a text file |
+| `/repeat [N]` | queue the last prompt again N times (default 1) with the current settings |
 | `/upscale PATH\|NAME\|off` | upscale after generating (see Profiles) |
 | `/profile NAME`, `/profiles` | switch / list profiles |
 | `/show` | all current settings, as TOML |

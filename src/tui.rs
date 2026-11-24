@@ -64,6 +64,10 @@ const COMMANDS: &[(&str, &str)] = &[
         "PATH: queue one image per line of a text file (# lines skipped)",
     ),
     (
+        "/repeat",
+        "[N]: queue the last prompt again N times (default 1), with the current settings",
+    ),
+    (
         "/upscale",
         "PATH|NAME|off: upscale after generating (local: ESRGAN file, server: hires upscaler)",
     ),
@@ -949,6 +953,30 @@ impl App {
                     self.input = prompt;
                     self.info(format!("loaded {rest} · Enter generates"));
                 }
+            }
+            "/repeat" | "/again" => {
+                let n: usize = if rest.is_empty() {
+                    1
+                } else {
+                    rest.parse()
+                        .ok()
+                        .filter(|n| (1..=1000).contains(n))
+                        .context("usage: /repeat [N] (N from 1 to 1000)")?
+                };
+                let prompt = self
+                    .history
+                    .iter()
+                    .rev()
+                    .find(|h| !h.starts_with('/'))
+                    .cloned()
+                    .context("no prompt to repeat yet")?;
+                (0..n).for_each(|_| self.enqueue(prompt.clone()));
+                let times = if n == 1 {
+                    "once".to_string()
+                } else {
+                    format!("{n} times")
+                };
+                self.good(format!("queued the last prompt {times}"));
             }
             "/resume" => {
                 anyhow::ensure!(

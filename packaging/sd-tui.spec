@@ -34,6 +34,9 @@ install -Dpm 0755 target/rpm/release/sd %{buildroot}%{_bindir}/sd
 %{_bindir}/sd
 
 %changelog
+* Tue Nov 24 2026 kernelzeroday - 0.2.6-1
+- /repeat [N] queues the last prompt again N times.
+
 * Tue Nov 24 2026 kernelzeroday - 0.2.2-1
 - Ctrl+C / Ctrl+D must be pressed twice in quick succession to quit.
 
