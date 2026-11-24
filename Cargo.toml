@@ -1,6 +1,6 @@
 [package]
 name = "sd-tui"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 description = "A streamlined terminal UI for stable-diffusion.cpp: type a prompt, get an image"
 license = "Apache-2.0"

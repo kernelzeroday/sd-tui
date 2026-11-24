@@ -82,7 +82,7 @@ const COMMANDS: &[(&str, &str)] = &[
     ("/resume", "[ID]: switch to another session"),
     ("/new", "start a new session"),
     ("/config", "show the config and session file paths"),
-    ("/quit", "exit (also Ctrl+C)"),
+    ("/quit", "exit (also Ctrl+C twice)"),
 ];
 
 const SET_HELP: &str = "Every setting is also a command: /KEY VALUE sets it, a bare /KEY opens a menu or \
@@ -106,9 +106,15 @@ const KEYS: &[(&str, &str)] = &[
         "Esc",
         "cancel the running image and the queue; otherwise clear the input",
     ),
-    ("Tab", "complete a /command, or a file path (/file, /batch, /load, ...)"),
+    (
+        "Tab",
+        "complete a /command, or a file path (/file, /batch, /load, ...)",
+    ),
     ("Ctrl+U", "clear the input"),
-    ("Ctrl+C", "quit"),
+    (
+        "Ctrl+C",
+        "clear the input; press twice quickly to quit (also Ctrl+D on an empty prompt)",
+    ),
 ];
 
 /// Commands whose argument is a file path, so Tab completes paths.
@@ -128,6 +134,9 @@ const PATH_COMMANDS: &[&str] = &[
 
 /// How long a non-error notice stays on the status line.
 const NOTICE_SECS: u64 = 6;
+
+/// Ctrl+C / Ctrl+D must be pressed twice within this long to quit.
+const QUIT_WINDOW: Duration = Duration::from_millis(1500);
 
 struct Request {
     prompt: String,
@@ -163,6 +172,8 @@ struct Notice {
     tone: Tone,
     text: String,
     at: Instant,
+    /// How long it stays up (errors: until dismissed).
+    ttl: Duration,
 }
 
 /// Scrollable text that temporarily replaces the image (/help, /show, /config).
@@ -205,6 +216,8 @@ pub struct App {
     queue: VecDeque<Request>,
     tick: usize,
     quit: bool,
+    /// The first Ctrl+C / Ctrl+D of a possible double press, and when it came.
+    quit_armed: Option<(char, Instant)>,
     /// Pop-up menu for a bare command, when open.
     menu: Option<Menu>,
 }
@@ -248,6 +261,7 @@ pub fn run(start: Start) -> Result<()> {
         queue: VecDeque::new(),
         tick: 0,
         quit: false,
+        quit_armed: None,
         menu: None,
     };
     syslog::debug(&format!(
@@ -483,8 +497,14 @@ impl App {
         }
         let empty = self.input.is_empty();
         match key.code {
-            KeyCode::Char('c') if ctrl => self.quit = true,
-            KeyCode::Char('d') if ctrl && empty => self.quit = true,
+            KeyCode::Char('c') if ctrl => {
+                // Like a shell prompt: the first Ctrl+C clears what you typed.
+                self.input.clear();
+                self.cursor = 0;
+                self.history_pos = None;
+                self.quit_key('c');
+            }
+            KeyCode::Char('d') if ctrl && empty => self.quit_key('d'),
             KeyCode::Char('u') if ctrl => {
                 self.input.clear();
                 self.cursor = 0;
@@ -577,7 +597,10 @@ impl App {
     fn menu_key(&mut self, key: KeyEvent, ctrl: bool) {
         let Some(m) = self.menu.as_mut() else { return };
         match key.code {
-            KeyCode::Char('c') if ctrl => self.quit = true,
+            KeyCode::Char('c') if ctrl => {
+                self.menu = None;
+                self.quit_key('c');
+            }
             KeyCode::Esc => self.menu = None,
             KeyCode::Up => m.move_by(-1),
             KeyCode::Down => m.move_by(1),
@@ -960,6 +983,30 @@ impl App {
         Ok(())
     }
 
+    /// Quit on the second Ctrl+C (or Ctrl+D) in quick succession; the first one only says so.
+    fn quit_key(&mut self, ch: char) {
+        if self
+            .quit_armed
+            .is_some_and(|(prev, at)| prev == ch && at.elapsed() < QUIT_WINDOW)
+        {
+            self.quit = true;
+            return;
+        }
+        self.quit_armed = Some((ch, Instant::now()));
+        let what = if self.running.is_some() {
+            " (cancels the running image)"
+        } else {
+            ""
+        };
+        let key = ch.to_ascii_uppercase();
+        self.notice = Some(Notice {
+            tone: Tone::Info,
+            text: format!("press Ctrl+{key} again to quit{what}"),
+            at: Instant::now(),
+            ttl: QUIT_WINDOW,
+        });
+    }
+
     // ---- notices --------------------------------------------------------------------
 
     fn notify(&mut self, tone: Tone, text: String) {
@@ -970,6 +1017,11 @@ impl App {
             tone,
             text,
             at: Instant::now(),
+            ttl: if tone == Tone::Bad {
+                Duration::MAX
+            } else {
+                Duration::from_secs(NOTICE_SECS)
+            },
         });
     }
     fn info(&mut self, s: String) {
@@ -984,9 +1036,7 @@ impl App {
 
     /// The notice to show now, if it hasn't expired.
     fn live_notice(&self) -> Option<&Notice> {
-        self.notice
-            .as_ref()
-            .filter(|n| n.tone == Tone::Bad || n.at.elapsed() < Duration::from_secs(NOTICE_SECS))
+        self.notice.as_ref().filter(|n| n.at.elapsed() < n.ttl)
     }
 
     // ---- drawing ----------------------------------------------------------------------

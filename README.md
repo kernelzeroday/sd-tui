@@ -43,7 +43,7 @@ sd --sessions              # recent sessions
 | ↑/↓ | move between the prompt's lines, then prompt history (restored when resuming) |
 | Tab | complete a /command, or a file path after `/file`, `/batch`, `/load`, `/upscale`, ... |
 | Ctrl+U | clear the input |
-| Ctrl+C | quit |
+| Ctrl+C | clear the input; press twice in quick succession to quit (Ctrl+D twice also quits, on an empty prompt) |
 
 ## Commands
 
