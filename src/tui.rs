@@ -1077,15 +1077,20 @@ impl App {
         self.input_width = area.width.saturating_sub(2) as usize;
         let rows = input_rows(&self.input, self.cursor, self.input_width);
         let max_rows = (area.height / 3).max(1) as usize;
-        self.input_box_sticky |= rows > STICKY_ROWS;
+        self.input_box_sticky |= rows > RESERVED_ROWS;
         self.input_box_rows = box_rows(rows, self.input_box_rows, self.input_box_sticky);
         let input_height = self.input_box_rows.clamp(1, max_rows) as u16 + 2;
-        let [image_area, status_area, input_area] = Layout::vertical([
-            Constraint::Min(4),
+        // The image's area doesn't depend on the prompt until the prompt outgrows the rows
+        // reserved for it; until then the spare rows sit blank above the status line.
+        let reserved = self.input_box_rows.max(RESERVED_ROWS).clamp(1, max_rows) as u16 + 2;
+        let [image_area, bottom] =
+            Layout::vertical([Constraint::Min(4), Constraint::Length(reserved + 1)]).areas(area);
+        let [_, status_area, input_area] = Layout::vertical([
+            Constraint::Min(0),
             Constraint::Length(1),
             Constraint::Length(input_height),
         ])
-        .areas(area);
+        .areas(bottom);
 
         self.draw_image(f, image_area);
         self.draw_status(f, status_area);
@@ -1526,26 +1531,21 @@ fn center_text(f: &mut Frame, inner: Rect, lines: Vec<Line>) {
     );
 }
 
-/// A prompt taller than this makes the prompt box keep its size for the session.
-const STICKY_ROWS: usize = 3;
+/// Text rows always kept free for the prompt box below the image, so prompts up to this tall
+/// never resize (and so redraw) the image. A taller prompt makes the box keep its size for the
+/// rest of the session.
+const RESERVED_ROWS: usize = 3;
 
 /// Prompt box height (in text rows) for a prompt of `rows` rows, given the current height.
-/// Up to two rows the box fits the prompt exactly. From three rows it grows with two spare
-/// rows, so the next lines don't resize it. A sticky box never shrinks; otherwise it shrinks
-/// to fit a prompt of one or two rows, or when the prompt has dropped well below the box
-/// (more than double the headroom spare).
+/// The box fits the prompt exactly until it is sticky (a prompt has been taller than
+/// `RESERVED_ROWS`). From then on it only grows, with two spare rows each time, so the next
+/// lines don't resize it.
 fn box_rows(rows: usize, current: usize, sticky: bool) -> usize {
     const HEADROOM: usize = 2;
     let rows = rows.max(1);
-    if sticky {
-        if rows > current {
-            rows + HEADROOM
-        } else {
-            current
-        }
-    } else if rows <= 2 {
+    if !sticky {
         rows
-    } else if rows > current || rows + 2 * HEADROOM < current {
+    } else if rows > current {
         rows + HEADROOM
     } else {
         current
@@ -1608,16 +1608,14 @@ mod tests {
 
     #[test]
     fn box_rows_has_headroom() {
+        // Not sticky: the box fits the prompt (the image keeps RESERVED_ROWS free anyway).
         assert_eq!(box_rows(1, 1, false), 1);
-        assert_eq!(box_rows(2, 1, false), 2); // two rows fit exactly, no spare rows
-        assert_eq!(box_rows(3, 2, false), 5); // from three rows: grow with two spare rows
-        assert_eq!(box_rows(5, 5, false), 5); // fills the spare rows without resizing
-        assert_eq!(box_rows(6, 5, false), 8);
-        assert_eq!(box_rows(4, 8, false), 8); // small deletions keep the size
-        assert_eq!(box_rows(3, 8, false), 5); // a big drop shrinks
-        assert_eq!(box_rows(2, 8, false), 2); // two rows or fewer fit exactly
-        assert_eq!(box_rows(1, 8, false), 1);
-        // After a prompt taller than three rows, the box only grows.
+        assert_eq!(box_rows(2, 1, false), 2);
+        assert_eq!(box_rows(3, 2, false), 3);
+        assert_eq!(box_rows(1, 3, false), 1);
+        // Sticky (a prompt taller than RESERVED_ROWS): grow with two spare rows, never shrink.
+        assert_eq!(box_rows(4, 3, true), 6);
+        assert_eq!(box_rows(6, 6, true), 6);
         assert_eq!(box_rows(1, 6, true), 6);
         assert_eq!(box_rows(7, 6, true), 9);
     }
